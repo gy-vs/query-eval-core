@@ -88,6 +88,42 @@ As an example, an infinite loop could be written in JSONata:
 
 This is tail recursive, and would run forever without the timeout guardrail.
 
+### Deterministic evaluation budget
+
+The `timeout` and `stack` guardrails are configured when the expression is compiled and depend (for `timeout`) on the wall-clock speed of the host machine.  If the same expression and data need to behave identically on every machine and on every invocation - e.g. when running untrusted customer expressions on a shared, multi-tenant server - a per-evaluation, deterministic *budget* can be passed to `evaluate()` as its third argument instead.
+
+The budget has two independent limits:
+
+- `steps`: the maximum number of evaluation steps.  Every expression node evaluation counts as one step, as does each iteration of the built-in higher-order functions (`$map`, `$filter`, `$single`, `$reduce`, `$each`, `$sift`, `$sort`/order-by), and the functions that build strings or sequences (`$pad`, `$join`, `$replace`, `$split`, `$match` and the range operator) charge for the characters/entries they are about to allocate *before* allocating them.  Error `D1014` is thrown as soon as the limit is exceeded - including partway through a loop.
+- `depth`: the maximum recursion depth of the eval-apply cycle.  A self-calling function with no terminating condition trips this error (`D1015`) before the JavaScript call stack can overflow.  Tail calls are optimized onto a trampoline and do not grow the depth; they are bounded by `steps` instead.
+
+The thrown error has a `budgetExceeded` property set to `'steps'` or `'depth'` (so it can be distinguished from ordinary expression errors), plus `consumed` (the number of steps used at the abort point), `value` (the configured limit) and `position` (the offset in the source expression of the node being evaluated when it aborted).
+
+After the evaluation finishes, the same object carries the actual resource usage in its `stepsUsed` and `depthPeak` properties.  These numbers depend only on the expression and the input data, so the same expression and input always produce the same values - they can be used for capacity planning and regression comparisons.  When no budget is supplied, evaluation behaves exactly as before.
+
+```javascript
+const jsonata = require('jsonata');
+
+(async () => {
+    const expression = jsonata('<JSONata expression>');
+    const budget = {
+        steps: 100000,  // abort after 100,000 evaluation steps
+        depth: 200      // abort if recursion goes 200 frames deep
+    };
+    try {
+        const result = await expression.evaluate(data, undefined, budget);
+    } catch (err) {
+        // err.code is 'D1014' (steps) or 'D1015' (depth)
+        // err.budgetExceeded is 'steps' or 'depth'
+        // err.consumed is the number of steps used at the abort
+        // err.position is the offset of the current expression node
+    }
+    // budget.stepsUsed and budget.depthPeak are populated on completion
+})()
+```
+
+The `steps` and `depth` limits, if supplied, must be non-negative integers; any other value causes `evaluate()` to reject with a `TypeError`.  A node-style callback can still be passed as the third argument, or supplied as the `callback` property of the budget object.
+
 ### Excessive sequence length
 
 It's possible to write expressions that result in excessively long result sequences.  This could ultimately lead to memory exhaustion in the host server. The `sequence` option can be set to specify the maximum sequence length that can be created by an expression, including any intermediate sequences created by sub-expressions.  Error `D2015` will be thrown if, during the evaluation of an expression, the evaluator attempts to generate a sequence exceeding this upper limit.

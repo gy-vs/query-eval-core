@@ -307,6 +307,8 @@ const functions = (() => {
                     value: padLength
                 };
             }
+            // charge the characters about to be allocated against the step budget
+            this.environment.base.chargeSteps(padLength, undefined);
             var padding = (new Array(padLength + 1)).join(char);
             if (char.length > 1) {
                 padding = substring(padding, 0, padLength);
@@ -398,6 +400,8 @@ const functions = (() => {
             var matches = await evaluateMatcher(regex, str);
             if (typeof matches !== 'undefined') {
                 while (typeof matches !== 'undefined' && (typeof limit === 'undefined' || count < limit)) {
+                    // charge one step per match
+                    this.environment.base.chargeSteps(1, undefined);
                     result.push({
                         match: matches.match,
                         index: matches.start,
@@ -510,24 +514,32 @@ const functions = (() => {
             if (typeof pattern === 'string') {
                 var index = str.indexOf(pattern, position);
                 while (index !== -1 && (typeof limit === 'undefined' || count < limit)) {
+                    // charge this iteration: one step plus the characters about to be appended
+                    self.environment.base.chargeSteps(
+                        1 + (index - position) + replacement.length, undefined);
                     result += str.substring(position, index);
                     result += replacement;
                     position = index + pattern.length;
                     count++;
                     index = str.indexOf(pattern, position);
                 }
+                // charge the remaining suffix before appending it
+                self.environment.base.chargeSteps(str.length - position, undefined);
                 result += str.substring(position);
             } else {
                 var matches = await evaluateMatcher(pattern, str);
                 if (typeof matches !== 'undefined') {
                     while (typeof matches !== 'undefined' && (typeof limit === 'undefined' || count < limit)) {
-                        result += str.substring(position, matches.start);
+                        var chunk = str.substring(position, matches.start);
                         var replacedWith = replacer.apply(self, [matches]);
                         if (isPromise(replacedWith)) {
                             replacedWith = await replacedWith;
                         }
                         // check replacedWith is a string
                         if (typeof replacedWith === 'string') {
+                            // charge this iteration: one step plus the characters about to be appended
+                            self.environment.base.chargeSteps(1 + chunk.length + replacedWith.length, undefined);
+                            result += chunk;
                             result += replacedWith;
                         } else {
                             // not a string - throw error
@@ -541,8 +553,12 @@ const functions = (() => {
                         count++;
                         matches = await evaluateMatcher(matches.next);
                     }
+                    // charge the remaining suffix before appending it
+                    self.environment.base.chargeSteps(str.length - position, undefined);
                     result += str.substring(position);
                 } else {
+                    // the matcher returns the input unchanged
+                    self.environment.base.chargeSteps(str.length, undefined);
                     result = str;
                 }
             }
@@ -736,15 +752,20 @@ const functions = (() => {
                 if (typeof matches !== 'undefined') {
                     var start = 0;
                     while (typeof matches !== 'undefined' && (typeof limit === 'undefined' || count < limit)) {
+                        // charge one step per match and the substring about to be pushed
+                        this.environment.base.chargeSteps(
+                            1 + (matches.start - start), undefined);
                         result.push(str.substring(start, matches.start));
                         start = matches.end;
                         matches = await evaluateMatcher(matches.next);
                         count++;
                     }
                     if (typeof limit === 'undefined' || count < limit) {
+                        this.environment.base.chargeSteps(str.length - start, undefined);
                         result.push(str.substring(start));
                     }
                 } else {
+                    this.environment.base.chargeSteps(str.length, undefined);
                     result.push(str);
                 }
             }
@@ -769,6 +790,14 @@ const functions = (() => {
         if (typeof separator === 'undefined') {
             separator = "";
         }
+
+        // charge the characters that join() is about to allocate against the step budget;
+        // the signature validator (<a<s>s?:s>) guarantees every item is a string
+        var resultLength = separator.length * (strs.length > 0 ? strs.length - 1 : 0);
+        for(var ii = 0; ii < strs.length; ii++) {
+            resultLength += strs[ii].length;
+        }
+        this.environment.base.chargeSteps(resultLength, undefined);
 
         return strs.join(separator);
     }
@@ -1502,6 +1531,8 @@ const functions = (() => {
         var result = this.createSequence();
         // do the map - iterate over the arrays, and invoke func
         for (var i = 0; i < arr.length; i++) {
+            // charge one step per iteration so the budget aborts mid-loop
+            this.environment.base.chargeSteps(1, undefined);
             var func_args = hofFuncArgs(func, arr[i], i, arr);
             // invoke func
             var res = await func.apply(this, func_args);
@@ -1528,6 +1559,8 @@ const functions = (() => {
         var result = this.createSequence();
 
         for (var i = 0; i < arr.length; i++) {
+            // charge one step per iteration so the budget aborts mid-loop
+            this.environment.base.chargeSteps(1, undefined);
             var entry = arr[i];
             var func_args = hofFuncArgs(func, entry, i, arr);
             // invoke func
@@ -1557,6 +1590,8 @@ const functions = (() => {
         var result;
 
         for (var i = 0; i < arr.length; i++) {
+            // charge one step per iteration so the budget aborts mid-loop
+            this.environment.base.chargeSteps(1, undefined);
             var entry = arr[i];
             var positiveResult = true;
             if (typeof func !== 'undefined') {
@@ -1648,6 +1683,8 @@ const functions = (() => {
         }
 
         while (index < sequence.length) {
+            // charge one step per iteration so the budget aborts mid-loop
+            this.environment.base.chargeSteps(1, undefined);
             var args = [result, sequence[index]];
             if (arity >= 3) {
                 args.push(index);
@@ -1840,6 +1877,8 @@ const functions = (() => {
         var result = this.createSequence();
 
         for (const key of utils.keys(obj)) {
+            // charge one step per iteration so the budget aborts mid-loop
+            this.environment.base.chargeSteps(1, undefined);
             var func_args = hofFuncArgs(func, obj[key], key, obj);
             // invoke func
             var val = await func.apply(this, func_args);
@@ -1933,6 +1972,8 @@ const functions = (() => {
             return undefined;
         }
 
+        var self = this;
+
         if (arr.length <= 1) {
             return arr;
         }
@@ -1962,14 +2003,18 @@ const functions = (() => {
                     Array.prototype.push.apply(result, right);
                 } else if (right.length === 0) {
                     Array.prototype.push.apply(result, left);
-                } else if (await comp(left[0], right[0])) { // invoke the comparator function
-                    // if it returns true - swap left and right
-                    result.push(right[0]);
-                    await merge_iter(result, left, right.slice(1));
                 } else {
-                    // otherwise keep the same order
-                    result.push(left[0]);
-                    await merge_iter(result, left.slice(1), right);
+                    // charge one step per comparator invocation so the budget aborts mid-sort
+                    self.environment.base.chargeSteps(1, undefined);
+                    if (await comp(left[0], right[0])) { // invoke the comparator function
+                        // if it returns true - swap left and right
+                        result.push(right[0]);
+                        await merge_iter(result, left, right.slice(1));
+                    } else {
+                        // otherwise keep the same order
+                        result.push(left[0]);
+                        await merge_iter(result, left.slice(1), right);
+                    }
                 }
             };
             var merged = [];
@@ -2069,6 +2114,8 @@ const functions = (() => {
         var result = Object.create(null);
 
         for (const item of utils.keys(arg)) {
+            // charge one step per iteration so the budget aborts mid-loop
+            this.environment.base.chargeSteps(1, undefined);
             var entry = arg[item];
             var func_args = hofFuncArgs(func, entry, item, arg);
             // invoke func

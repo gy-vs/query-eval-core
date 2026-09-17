@@ -51,6 +51,20 @@ var jsonata = (function() {
 
         environment.base.depth++;
         environment.base.guardrails();
+        // account for this evaluation step and enforce both budgets.
+        // the counters are always maintained so the resource usage can be reported,
+        // even when no limit has been set
+        var base = environment.base;
+        base.stepsUsed++;
+        if (base.stepsUsed > base.stepLimit) {
+            base.throwBudgetError('D1014', base.stepLimit, expr.position);
+        }
+        if (base.depth > base.depthPeak) {
+            base.depthPeak = base.depth;
+        }
+        if (base.depth > base.depthLimit) {
+            base.throwBudgetError('D1015', base.depthLimit, expr.position);
+        }
         var entryCallback = environment.lookup(Symbol.for('jsonata.__evaluate_entry'));
         if(entryCallback) {
             await entryCallback(expr, input, environment);
@@ -489,7 +503,7 @@ var jsonata = (function() {
                     result = evaluateStringConcat(lhs, rhs);
                     break;
                 case '..':
-                    result = evaluateRangeExpression(lhs, rhs, environment);
+                    result = evaluateRangeExpression(lhs, rhs, environment, expr.position);
                     break;
                 case 'in':
                     result = evaluateIncludesExpression(lhs, rhs);
@@ -1027,7 +1041,7 @@ var jsonata = (function() {
      * @param {Object} rhs - RHS value
      * @returns {Array} Resultant array
      */
-    function evaluateRangeExpression(lhs, rhs, environment) {
+    function evaluateRangeExpression(lhs, rhs, environment, position) {
         var result;
 
         if (typeof lhs !== 'undefined' && !Number.isInteger(lhs)) {
@@ -1073,6 +1087,9 @@ var jsonata = (function() {
                 value: size
             };
         }
+
+        // charge the entries the range is about to allocate against the step budget
+        environment.base.chargeSteps(size, position);
 
         result = new Array(size);
         for (var item = lhs, index = 0; item <= rhs; item++, index++) {
@@ -1838,6 +1855,10 @@ var jsonata = (function() {
         try {
             var result = await evaluate(ast, input, this.environment);
         } catch(err) {
+            if(err.budgetExceeded) {
+                // budget exhaustion aborts the whole evaluation - do not wrap it as an eval error
+                throw err;
+            }
             // error evaluating the expression passed to $eval
             populateMessage(err);
             throw {
@@ -2029,6 +2050,8 @@ var jsonata = (function() {
         "D1011": "Stack overflow. Check for non-terminating recursive function.  Consider rewriting as tail-recursive",
         "D1012": "Evaluation timeout after {{value}} milliseconds. Check for infinite loop",
         "D1013": "Object property names starting with _jsonata_ are reserved for internal use: {{value}}",
+        "D1014": "The evaluation step budget of {{value}} steps was exceeded after {{consumed}} steps",
+        "D1015": "The recursion depth limit of {{value}} was exceeded after {{consumed}} steps",
         "T2001": "The left side of the {{token}} operator must evaluate to a number",
         "T2002": "The right side of the {{token}} operator must evaluate to a number",
         "T2003": "The left side of the range operator (..) must evaluate to an integer",
@@ -2113,6 +2136,37 @@ var jsonata = (function() {
     }
 
     /**
+     * Validate the runtime options passed to a single evaluate() invocation.  Only the
+     * evaluation budget (steps and recursion depth) is accepted at this point; the compile
+     * time options (timeout, stack, sequence, etc.) are fixed when the expression is compiled.
+     * @param {Object} runtimeOptions - the options passed to evaluate()
+     * @returns {Object} validated budget limits
+     */
+    function validateRuntimeOptions(runtimeOptions) {
+        return {
+            steps: validateBudgetLimit(runtimeOptions.steps, 'steps'),
+            depth: validateBudgetLimit(runtimeOptions.depth, 'depth')
+        };
+    }
+
+    /**
+     * Validate a single budget limit.  An undefined value means 'no limit'; an explicit
+     * non-negative integer sets a limit.
+     * @param {*} value - the candidate limit
+     * @param {string} name - the name of the budget property
+     * @returns {number} the validated limit (Infinity if not specified)
+     */
+    function validateBudgetLimit(value, name) {
+        if (typeof value === 'undefined') {
+            return Infinity;
+        }
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+            throw new TypeError('The "' + name + '" budget option must be a non-negative integer');
+        }
+        return value;
+    }
+
+    /**
      * JSONata
      * @param {Object} expr - JSONata expression
      * @param {Object} options
@@ -2147,6 +2201,24 @@ var jsonata = (function() {
 
         return {
             evaluate: async function (input, bindings, callback) {
+                // the third argument is either a node-style callback or an object of
+                // runtime options (evaluation budget); the latter may itself carry a callback
+                var runtimeOptions = callback;
+                if (typeof callback === 'function') {
+                    runtimeOptions = {};
+                } else if (typeof callback !== 'object' || callback === null) {
+                    // null or a primitive: no budget, no callback
+                    runtimeOptions = {};
+                    callback = undefined;
+                } else {
+                    callback = runtimeOptions.callback;
+                }
+                // validate the evaluation budget - a TypeError is thrown synchronously for bad options
+                var budget = validateRuntimeOptions(runtimeOptions);
+                // the counters are written back to the runtime options on completion
+                runtimeOptions.stepsUsed = 0;
+                runtimeOptions.depthPeak = 0;
+
                 // throw if the expression compiled with syntax errors
                 if(typeof errors !== 'undefined') {
                     var err = {
@@ -2228,6 +2300,30 @@ var jsonata = (function() {
                 exec_env.base = exec_env;
                 exec_env.depth = 0;
 
+                // evaluation budget - the counters are always maintained so that the
+                // consumed steps and peak depth can be reported, even when no limit is set
+                exec_env.stepLimit = budget.steps;
+                exec_env.depthLimit = budget.depth;
+                exec_env.stepsUsed = 0;
+                exec_env.depthPeak = 0;
+                exec_env.throwBudgetError = function (code, limit, position) {
+                    throw {
+                        code: code,
+                        budgetExceeded: code === 'D1014' ? 'steps' : 'depth',
+                        value: limit,
+                        consumed: exec_env.stepsUsed,
+                        position: position,
+                        stack: (new Error()).stack
+                    };
+                };
+                // account for `count` steps without allocating a throw object unless over budget
+                exec_env.chargeSteps = function (count, position) {
+                    exec_env.stepsUsed += count;
+                    if (exec_env.stepsUsed > exec_env.stepLimit) {
+                        exec_env.throwBudgetError('D1014', exec_env.stepLimit, position);
+                    }
+                };
+
                 if(options && options.RegexEngine) {
                     exec_env.RegexEngine = options.RegexEngine;
                 } else {
@@ -2245,6 +2341,10 @@ var jsonata = (function() {
                     // insert error message into structure
                     populateMessage(err); // possible side-effects on `err`
                     throw err;
+                } finally {
+                    // report the consumed budget to the caller
+                    runtimeOptions.stepsUsed = exec_env.stepsUsed;
+                    runtimeOptions.depthPeak = exec_env.depthPeak;
                 }
             },
             assign: function (name, value) {

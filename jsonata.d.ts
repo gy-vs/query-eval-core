@@ -52,6 +52,23 @@ declare namespace jsonata {
     token: string;
   }
 
+  /**
+   * Options accepted by a single `evaluate()` invocation.  The third argument to
+   * `evaluate` is either a node-style callback or one of these objects.
+   */
+  interface JsonataRuntimeOptions {
+    /** maximum number of evaluation steps; aborts with code 'D1014' when exceeded */
+    steps?: number;
+    /** maximum recursion depth; aborts with code 'D1015' when exceeded */
+    depth?: number;
+    /** optional node-style callback, equivalent to passing the callback directly */
+    callback?: (err: JsonataError | null, resp: any) => void;
+    /** number of steps consumed, populated when the evaluation finishes */
+    stepsUsed?: number;
+    /** peak recursion depth reached, populated when the evaluation finishes */
+    depthPeak?: number;
+  }
+
   interface Environment {
     bind(name: string | symbol, value: any): void;
     lookup(name: string | symbol): any;
@@ -67,6 +84,7 @@ declare namespace jsonata {
   interface Expression {
     evaluate(input: any, bindings?: Record<string, any>): Promise<any>;
     evaluate(input: any, bindings: Record<string, any> | undefined, callback: (err: JsonataError, resp: any) => void): void;
+    evaluate(input: any, bindings: Record<string, any> | undefined, options: JsonataRuntimeOptions): Promise<any>;
     assign(name: string, value: any): void;
     registerFunction(name: string, implementation: (this: Focus, ...args: any[]) => any, signature?: string): void;
     ast(): ExprNode;
