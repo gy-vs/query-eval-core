@@ -37,6 +37,39 @@ var jsonata = (function() {
 
     // Start of Evaluator code
 
+    /**
+     * Create a budget exceeded error
+     * @param {string} limit - the name of the budget limit that was exceeded ('steps' or 'depth')
+     * @param {number} consumed - the amount of the budget consumed at the point of termination
+     * @param {number} position - the offset in the expression being evaluated when terminated
+     * @returns {Object} the budget exceeded error object
+     */
+    function budgetExceeded(limit, consumed, position) {
+        return {
+            code: limit === 'steps' ? 'D1014' : 'D1015',
+            limit: limit,
+            value: consumed,
+            position: position,
+            stack: (new Error()).stack
+        };
+    }
+
+    /**
+     * Validate a single limit within the evaluation budget object
+     * @param {Object} budget - the budget object passed to evaluate()
+     * @param {string} name - the name of the limit being validated ('steps' or 'depth')
+     * @returns {number|undefined} the validated limit, or undefined if it was not supplied
+     */
+    function validateBudgetLimit(budget, name) {
+        var limit = budget[name];
+        if(typeof limit !== 'undefined') {
+            if(typeof limit !== 'number' || !Number.isInteger(limit) || limit <= 0) {
+                throw new TypeError("The '" + name + "' property of the evaluation budget must be a positive integer");
+            }
+        }
+        return limit;
+    }
+
     var staticFrame = createFrame(null);
 
     /**
@@ -51,6 +84,7 @@ var jsonata = (function() {
 
         environment.base.depth++;
         environment.base.guardrails();
+        environment.base.tick(1, expr.position);
         var entryCallback = environment.lookup(Symbol.for('jsonata.__evaluate_entry'));
         if(entryCallback) {
             await entryCallback(expr, input, environment);
@@ -489,7 +523,7 @@ var jsonata = (function() {
                     result = evaluateStringConcat(lhs, rhs);
                     break;
                 case '..':
-                    result = evaluateRangeExpression(lhs, rhs, environment);
+                    result = evaluateRangeExpression(lhs, rhs, environment, expr.position);
                     break;
                 case 'in':
                     result = evaluateIncludesExpression(lhs, rhs);
@@ -1025,9 +1059,11 @@ var jsonata = (function() {
      * Evaluate range expression against input data
      * @param {Object} lhs - LHS value
      * @param {Object} rhs - RHS value
+     * @param {Object} environment - Environment
+     * @param {number} position - the offset of the range operator in the expression
      * @returns {Array} Resultant array
      */
-    function evaluateRangeExpression(lhs, rhs, environment) {
+    function evaluateRangeExpression(lhs, rhs, environment, position) {
         var result;
 
         if (typeof lhs !== 'undefined' && !Number.isInteger(lhs)) {
@@ -1073,6 +1109,9 @@ var jsonata = (function() {
                 value: size
             };
         }
+
+        // charge the allocation against the step budget before reserving the memory
+        environment.base.reserve(size, position);
 
         result = new Array(size);
         for (var item = lhs, index = 0; item <= rhs; item++, index++) {
@@ -1506,10 +1545,18 @@ var jsonata = (function() {
     async function apply(proc, args, input, environment) {
         var result;
         result = await applyInner(proc, args, input, environment);
+        var tailDepth = 0;
         while(isLambda(result) && result.thunk === true) {
             // trampoline loop - this gets invoked as a result of tail-call optimization
             // the function returned a tail-call thunk
             // unpack it, evaluate its arguments, and apply the tail call
+            // the JS stack does not grow on this path, so the recursion depth is only
+            // tracked when the caller has supplied a (deterministic) depth budget
+            if(typeof environment.base.depthLimit !== 'undefined') {
+                environment.base.depth++;
+                tailDepth++;
+            }
+            environment.base.tick(1, result.body.procedure.position);
             var next = await evaluate(result.body.procedure, result.input, result.environment);
             if(result.body.procedure.type === 'variable') {
                 next.token = result.body.procedure.value;
@@ -1521,6 +1568,9 @@ var jsonata = (function() {
             }
 
             result = await applyInner(next, evaluatedArgs, input, environment);
+        }
+        if(tailDepth > 0) {
+            environment.base.depth -= tailDepth;
         }
         return result;
     }
@@ -2029,6 +2079,8 @@ var jsonata = (function() {
         "D1011": "Stack overflow. Check for non-terminating recursive function.  Consider rewriting as tail-recursive",
         "D1012": "Evaluation timeout after {{value}} milliseconds. Check for infinite loop",
         "D1013": "Object property names starting with _jsonata_ are reserved for internal use: {{value}}",
+        "D1014": "Evaluation step budget exceeded after {{value}} steps at position {{position}}",
+        "D1015": "Recursion depth budget exceeded at depth {{value}} at position {{position}}",
         "T2001": "The left side of the {{token}} operator must evaluate to a number",
         "T2002": "The right side of the {{token}} operator must evaluate to a number",
         "T2003": "The left side of the range operator (..) must evaluate to an integer",
@@ -2146,7 +2198,18 @@ var jsonata = (function() {
         }, '<:n>'));
 
         return {
-            evaluate: async function (input, bindings, callback) {
+            /**
+             * Evaluate the expression against the supplied input
+             * @param {*} input - the input data to evaluate the expression against
+             * @param {Object} [bindings] - variable bindings set in the scope of this evaluation
+             * @param {Function} [callback] - callback invoked with (err, result)
+             * @param {Object} [budget] - deterministic evaluation budget
+             * @param {number} [budget.steps] - maximum number of evaluation steps
+             * @param {number} [budget.depth] - maximum recursion depth
+             * @returns {*} - the result of evaluating the expression; on completion the budget
+             * object (if supplied) reports `stepsUsed` and `depthPeak`
+             */
+            evaluate: async function (input, bindings, callback, budget) {
                 // throw if the expression compiled with syntax errors
                 if(typeof errors !== 'undefined') {
                     var err = {
@@ -2155,6 +2218,17 @@ var jsonata = (function() {
                     };
                     populateMessage(err); // possible side-effects on `err`
                     throw err;
+                }
+
+                // validate the optional evaluation budget; the limits, if supplied, must be positive integers
+                var stepLimit;
+                var depthLimit;
+                if(typeof budget !== 'undefined') {
+                    if(budget === null || typeof budget !== 'object') {
+                        throw new TypeError("The evaluation budget must be an object containing 'steps' and/or 'depth' limits");
+                    }
+                    stepLimit = validateBudgetLimit(budget, 'steps');
+                    depthLimit = validateBudgetLimit(budget, 'depth');
                 }
 
                 const exec_env = createFrame(environment);
@@ -2220,7 +2294,7 @@ var jsonata = (function() {
                                 stack: (new Error()).stack
                             };
                         }
-    
+
                     }
                 } else {
                     exec_env.guardrails = function() {};
@@ -2228,15 +2302,54 @@ var jsonata = (function() {
                 exec_env.base = exec_env;
                 exec_env.depth = 0;
 
+                // deterministic evaluation budget; the counters are scoped to this invocation
+                // when no budget is supplied at all, the evaluator does no bookkeeping - this
+                // keeps the unbounded code path identical in behaviour to the original evaluator
+                exec_env.steps = 0;
+                exec_env.depthPeak = 0;
+                exec_env.stepLimit = stepLimit;
+                exec_env.depthLimit = depthLimit;
+                exec_env.position = 0;
+                var budgetActive = typeof budget !== 'undefined';
+                exec_env.tick = function(count, position) {
+                    if(!budgetActive) {
+                        return;
+                    }
+                    if(position !== -1) {
+                        exec_env.position = position;
+                    }
+                    exec_env.steps += count;
+                    if(exec_env.depth > exec_env.depthPeak) {
+                        exec_env.depthPeak = exec_env.depth;
+                    }
+                    if(typeof stepLimit !== 'undefined' && exec_env.steps > stepLimit) {
+                        throw budgetExceeded('steps', exec_env.steps, exec_env.position);
+                    }
+                    if(typeof depthLimit !== 'undefined' && exec_env.depth > depthLimit) {
+                        throw budgetExceeded('depth', exec_env.depth, exec_env.position);
+                    }
+                };
+                exec_env.reserve = function(count, position) {
+                    // charge a bulk allocation (e.g. a large string or sequence) before the memory is committed
+                    exec_env.tick(count, position);
+                };
+
                 if(options && options.RegexEngine) {
                     exec_env.RegexEngine = options.RegexEngine;
                 } else {
                     exec_env.RegexEngine = RegExp;
                 }
 
-                var it;
+                var reportBudget = function() {
+                    // report the consumed budget to the caller; this is set on both success and failure
+                    if(typeof budget !== 'undefined') {
+                        budget.stepsUsed = exec_env.steps;
+                        budget.depthPeak = exec_env.depthPeak;
+                    }
+                };
                 try {
-                    it = await evaluate(ast, input, exec_env);
+                    var it = await evaluate(ast, input, exec_env);
+                    reportBudget();
                     if (typeof callback === "function") {
                         callback(null, it);
                     }
@@ -2244,6 +2357,7 @@ var jsonata = (function() {
                 } catch (err) {
                     // insert error message into structure
                     populateMessage(err); // possible side-effects on `err`
+                    reportBudget();
                     throw err;
                 }
             },

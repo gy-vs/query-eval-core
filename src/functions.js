@@ -307,6 +307,8 @@ const functions = (() => {
                     value: padLength
                 };
             }
+            // charge the padded characters to the step budget before allocating the string
+            this.environment.base.reserve(padLength, -1);
             var padding = (new Array(padLength + 1)).join(char);
             if (char.length > 1) {
                 padding = substring(padding, 0, padLength);
@@ -398,6 +400,7 @@ const functions = (() => {
             var matches = await evaluateMatcher(regex, str);
             if (typeof matches !== 'undefined') {
                 while (typeof matches !== 'undefined' && (typeof limit === 'undefined' || count < limit)) {
+                    this.environment.base.tick(1, -1);
                     result.push({
                         match: matches.match,
                         index: matches.start,
@@ -505,29 +508,37 @@ const functions = (() => {
         var result = '';
         var position = 0;
 
+        // charge a chunk of the output string to the step budget before the memory is appended
+        var charge = function(chunkLength) {
+            self.environment.base.reserve(chunkLength, -1);
+        };
+
         if (typeof limit === 'undefined' || limit > 0) {
             var count = 0;
             if (typeof pattern === 'string') {
                 var index = str.indexOf(pattern, position);
                 while (index !== -1 && (typeof limit === 'undefined' || count < limit)) {
+                    charge(str.substring(position, index).length + replacement.length);
                     result += str.substring(position, index);
                     result += replacement;
                     position = index + pattern.length;
                     count++;
                     index = str.indexOf(pattern, position);
                 }
+                charge(str.substring(position).length);
                 result += str.substring(position);
             } else {
                 var matches = await evaluateMatcher(pattern, str);
                 if (typeof matches !== 'undefined') {
                     while (typeof matches !== 'undefined' && (typeof limit === 'undefined' || count < limit)) {
-                        result += str.substring(position, matches.start);
                         var replacedWith = replacer.apply(self, [matches]);
                         if (isPromise(replacedWith)) {
                             replacedWith = await replacedWith;
                         }
                         // check replacedWith is a string
                         if (typeof replacedWith === 'string') {
+                            charge(str.substring(position, matches.start).length + replacedWith.length);
+                            result += str.substring(position, matches.start);
                             result += replacedWith;
                         } else {
                             // not a string - throw error
@@ -541,6 +552,7 @@ const functions = (() => {
                         count++;
                         matches = await evaluateMatcher(matches.next);
                     }
+                    charge(str.substring(position).length);
                     result += str.substring(position);
                 } else {
                     result = str;
@@ -736,6 +748,7 @@ const functions = (() => {
                 if (typeof matches !== 'undefined') {
                     var start = 0;
                     while (typeof matches !== 'undefined' && (typeof limit === 'undefined' || count < limit)) {
+                        this.environment.base.tick(1, -1);
                         result.push(str.substring(start, matches.start));
                         start = matches.end;
                         matches = await evaluateMatcher(matches.next);
@@ -769,6 +782,16 @@ const functions = (() => {
         if (typeof separator === 'undefined') {
             separator = "";
         }
+
+        // charge the size of the joined string to the step budget before allocating it
+        var joinLength = 0;
+        for (var i = 0; i < strs.length; i++) {
+            joinLength += strs[i].length;
+        }
+        if(strs.length > 1) {
+            joinLength += separator.length * (strs.length - 1);
+        }
+        this.environment.base.reserve(joinLength, -1);
 
         return strs.join(separator);
     }
@@ -1502,6 +1525,7 @@ const functions = (() => {
         var result = this.createSequence();
         // do the map - iterate over the arrays, and invoke func
         for (var i = 0; i < arr.length; i++) {
+            this.environment.base.tick(1, -1);
             var func_args = hofFuncArgs(func, arr[i], i, arr);
             // invoke func
             var res = await func.apply(this, func_args);
@@ -1528,6 +1552,7 @@ const functions = (() => {
         var result = this.createSequence();
 
         for (var i = 0; i < arr.length; i++) {
+            this.environment.base.tick(1, -1);
             var entry = arr[i];
             var func_args = hofFuncArgs(func, entry, i, arr);
             // invoke func
@@ -1557,6 +1582,7 @@ const functions = (() => {
         var result;
 
         for (var i = 0; i < arr.length; i++) {
+            this.environment.base.tick(1, -1);
             var entry = arr[i];
             var positiveResult = true;
             if (typeof func !== 'undefined') {
@@ -1648,6 +1674,7 @@ const functions = (() => {
         }
 
         while (index < sequence.length) {
+            this.environment.base.tick(1, -1);
             var args = [result, sequence[index]];
             if (arity >= 3) {
                 args.push(index);
@@ -1840,6 +1867,7 @@ const functions = (() => {
         var result = this.createSequence();
 
         for (const key of utils.keys(obj)) {
+            this.environment.base.tick(1, -1);
             var func_args = hofFuncArgs(func, obj[key], key, obj);
             // invoke func
             var val = await func.apply(this, func_args);
@@ -1956,6 +1984,8 @@ const functions = (() => {
             comp = comparator;
         }
 
+        var base = this.environment.base;
+
         var merge = async function (l, r) {
             var merge_iter = async function (result, left, right) {
                 if (left.length === 0) {
@@ -1964,10 +1994,12 @@ const functions = (() => {
                     Array.prototype.push.apply(result, left);
                 } else if (await comp(left[0], right[0])) { // invoke the comparator function
                     // if it returns true - swap left and right
+                    base.tick(1, -1);
                     result.push(right[0]);
                     await merge_iter(result, left, right.slice(1));
                 } else {
                     // otherwise keep the same order
+                    base.tick(1, -1);
                     result.push(left[0]);
                     await merge_iter(result, left.slice(1), right);
                 }
@@ -2069,6 +2101,7 @@ const functions = (() => {
         var result = Object.create(null);
 
         for (const item of utils.keys(arg)) {
+            this.environment.base.tick(1, -1);
             var entry = arg[item];
             var func_args = hofFuncArgs(func, entry, item, arg);
             // invoke func

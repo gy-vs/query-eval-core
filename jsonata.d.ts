@@ -52,6 +52,27 @@ declare namespace jsonata {
     token: string;
   }
 
+  /**
+   * Deterministic evaluation budget.  After `evaluate` settles (whether it
+   * resolves or rejects), the same object is annotated with the consumed
+   * `stepsUsed` and the peak recursion depth `depthPeak`.
+   */
+  interface EvaluationBudget {
+    /** Maximum number of evaluation steps before the evaluation is aborted */
+    steps?: number;
+    /** Maximum recursion depth before the evaluation is aborted */
+    depth?: number;
+    /** Number of steps consumed by the evaluation (set on completion) */
+    stepsUsed?: number;
+    /** Peak recursion depth reached during the evaluation (set on completion) */
+    depthPeak?: number;
+  }
+
+  interface BudgetExceededError extends JsonataError {
+    /** Which limit was exceeded: 'steps' or 'depth' */
+    limit: "steps" | "depth";
+  }
+
   interface Environment {
     bind(name: string | symbol, value: any): void;
     lookup(name: string | symbol): any;
@@ -67,6 +88,12 @@ declare namespace jsonata {
   interface Expression {
     evaluate(input: any, bindings?: Record<string, any>): Promise<any>;
     evaluate(input: any, bindings: Record<string, any> | undefined, callback: (err: JsonataError, resp: any) => void): void;
+    evaluate(
+      input: any,
+      bindings: Record<string, any> | undefined,
+      callback: ((err: JsonataError, resp: any) => void) | undefined,
+      budget: EvaluationBudget
+    ): Promise<any>;
     assign(name: string, value: any): void;
     registerFunction(name: string, implementation: (this: Focus, ...args: any[]) => any, signature?: string): void;
     ast(): ExprNode;

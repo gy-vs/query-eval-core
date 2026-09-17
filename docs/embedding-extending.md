@@ -31,9 +31,11 @@ If the expression is not valid JSONata, an `Error` is thrown containing informat
 
 `expression` has three methods:
 
-### expression.evaluate(input[, bindings[, callback]])
+### expression.evaluate(input[, bindings[, callback[, budget]]])
 
 Run the compiled JSONata expression against object `input` and return the result as a new object.
+
+An optional `budget` object (`{steps, depth}`) imposes a deterministic limit on the number of evaluation steps and/or the recursion depth; on completion it is annotated with the consumed `stepsUsed` and the `depthPeak`.  See [Configuring Guardrails](guardrails#deterministic-evaluation-budget) for details.
 
 ```javascript
 var result = await expression.evaluate({example: [{value: 4}, {value: 7}, {value: 13}]});
